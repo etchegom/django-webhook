@@ -6,8 +6,10 @@ from django.conf import settings
 from django.db import models
 from django.db.models.signals import ModelSignal, post_delete, post_save
 from django.forms import model_to_dict
+from django.utils.module_loading import import_string
 
 from django_webhook.models import Webhook
+from typing import assert_never
 
 from .tasks import fire_webhook
 from .util import cache
@@ -39,18 +41,23 @@ class SignalListener:
                 action_type = UPDATE
             case "post_delete":
                 action_type = DELETE
+            case _:
+                assert_never(self.signal_name)
 
         topic = f"{self.model_label}/{action_type}"
-        webhook_ids = _find_webhooks(topic)
+        webhook_ids = self.find_webhooks(topic=topic, instance=instance)
 
         for id, uuid in webhook_ids:
             payload = dict(
                 topic=topic,
-                object=model_dict(instance),
+                object=self.model_dict(instance),
                 object_type=self.model_label,
                 webhook_uuid=str(uuid),
             )
             fire_webhook.delay(id, payload)
+
+    def find_webhooks(self, topic: str, instance=None):
+        return _find_webhooks(topic)
 
     def connect(self):
         self.signal.connect(
@@ -65,27 +72,36 @@ class SignalListener:
     def model_label(self):
         return self.model_cls._meta.label
 
+    def model_dict(self, model):
+        """
+        Returns the model instance as a dict, nested values for related models.
+        """
+        fields = {
+            field.name: field.value_from_object(model) for field in model._meta.fields
+        }
+        return model_to_dict(model, fields=fields)  # type: ignore
+
 
 def connect_signals():
+    SignalListenerClass = import_string(
+        dotted_path=settings.DJANGO_WEBHOOK.get(
+            "SIGNAL_LISTENER", "django_webhook.signals.SignalListener"
+        )
+    )
+    if not issubclass(SignalListenerClass, SignalListener):
+        raise ValueError(
+            f"{SignalListenerClass} must be a subclass of {SignalListener}"
+        )
+        
     for cls in _active_models():
-        post_save_listener = SignalListener(
+        post_save_listener = SignalListenerClass(
             signal=post_save, signal_name="post_save", model_cls=cls
         )
-        post_delete_listener = SignalListener(
+        post_delete_listener = SignalListenerClass(
             signal=post_delete, signal_name="post_delete", model_cls=cls
         )
         post_save_listener.connect()
         post_delete_listener.connect()
-
-
-def model_dict(model):
-    """
-    Returns the model instance as a dict, nested values for related models.
-    """
-    fields = {
-        field.name: field.value_from_object(model) for field in model._meta.fields
-    }
-    return model_to_dict(model, fields=fields)  # type: ignore
 
 
 def _active_models():
